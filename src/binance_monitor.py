@@ -10,35 +10,65 @@
   冷却:同币种 30 分钟内不重复推送
 
 使用:
-  export WECOM_KEY=你的企微群机器人 key
-  python3 binance_monitor.py
+  cp configs/.env.example configs/.env
+  编辑 configs/.env
+  python3 src/binance_monitor.py
 """
 import os
 import time
 import requests
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Tuple, Dict, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG_FILE = PROJECT_ROOT / "configs" / ".env"
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+def env_int(name: str, default: int) -> int:
+    return int(os.getenv(name, str(default)))
+
+
+def env_float(name: str, default: float) -> float:
+    return float(os.getenv(name, str(default)))
+
+
+load_env_file(Path(os.getenv("CONFIG_FILE", DEFAULT_CONFIG_FILE)))
 
 # ============ 配置 ============
 WECOM_WEBHOOK_KEY   = os.getenv("WECOM_KEY", "PUT_YOUR_WECOM_KEY_HERE")
 
-SCAN_INTERVAL_SEC   = 60
-ALERT_COOLDOWN_SEC  = 1800
+SCAN_INTERVAL_SEC   = env_int("SCAN_INTERVAL_SEC", 60)
+ALERT_COOLDOWN_SEC  = env_int("ALERT_COOLDOWN_SEC", 1800)
 
-MIN_24H_QUOTE_VOL   = 1_000_000   # 24h 成交额下限 (USDT)
-TOP_N_BY_VOLUME     = 150         # 每个市场只扫 24h 成交额前 N
-CONCURRENCY         = 40          # 并发请求数
+MIN_24H_QUOTE_VOL   = env_float("MIN_24H_QUOTE_VOL", 1_000_000)  # 24h 成交额下限 (USDT)
+TOP_N_BY_VOLUME     = env_int("TOP_N_BY_VOLUME", 150)            # 每个市场只扫 24h 成交额前 N
+CONCURRENCY         = env_int("CONCURRENCY", 40)                 # 并发请求数
 
 # 现货信号
-SPOT_PRICE_5M_PCT   = 2.0
-SPOT_VOL_5M_RATIO   = 3.0
+SPOT_PRICE_5M_PCT   = env_float("SPOT_PRICE_5M_PCT", 2.0)
+SPOT_VOL_5M_RATIO   = env_float("SPOT_VOL_5M_RATIO", 3.0)
 
 # 合约信号
-FUT_PRICE_5M_PCT    = 2.0
-FUT_OI_5M_PCT       = 3.0
+FUT_PRICE_5M_PCT    = env_float("FUT_PRICE_5M_PCT", 2.0)
+FUT_OI_5M_PCT       = env_float("FUT_OI_5M_PCT", 3.0)
 
-REQ_TIMEOUT         = 8
+REQ_TIMEOUT         = env_int("REQ_TIMEOUT", 8)
 SPOT_API            = "https://api.binance.com"
 FAPI                = "https://fapi.binance.com"
 # =============================
