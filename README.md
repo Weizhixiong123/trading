@@ -9,7 +9,8 @@ trading/
 ├─ configs/
 │  └─ .env.example
 ├─ src/
-│  └─ binance_monitor.py
+│  ├─ binance_monitor.py
+│  └─ hype_radar.py
 ├─ tests/
 ├─ .gitignore
 ├─ README.md
@@ -38,6 +39,50 @@ python src/binance_monitor.py
 - 冷却：同一币种默认 4 小时内不重复推送同级别信号。
 
 这版监控更适合提前发现 4H 级别的启动和蓄势币，不再以 5 分钟急拉作为主要判断依据。
+
+## 热度雷达 hype_radar.py
+
+把"舆情热度"和"行情波动"对齐到同一个币种维度，分三类输出：
+
+- **A 趋势**：涨幅 ≥ 阈值 且 振幅 ≥ 阈值，量价齐升的真趋势（默认看合约盘）
+- **B 暴雷**：跌幅 ≤ 阈值 且 振幅 ≥ 阈值，已经崩盘的绞肉机，仅供回避或做空研究
+- **C 舆情驱动**：CoinGecko trending ∩ 币安 USDT 交易对，能交易的"被搜的币"
+
+数据源全部公开免登录：
+
+- **CoinGecko `/search/trending`**：近 24h 用户搜索最热的 15 个币
+- **Binance 现货 + U 本位合约 24h ticker**：涨幅、振幅、成交额
+
+```bash
+python3 src/hype_radar.py
+
+# 可选：补一些 CoinGecko 没收录但你想盯的币
+EXTRA_HYPE_KEYWORDS="MEME,POPCAT" python3 src/hype_radar.py
+```
+
+推送：脚本读取 `configs/.env` 里的 `WECOM_KEY`（与 `binance_monitor.py` 共用），
+跑完会把 **S 超级信号 / C 舆情驱动 / A 趋势 / B 暴雷** 四个桶用 markdown 推到企业微信。
+未配置时自动 DRY-RUN，只打印不推送。可以挂到 cron 定时跑：
+
+```bash
+# 每小时整点跑一次
+0 * * * * cd /home/trading && /usr/bin/python3 src/hype_radar.py >> /tmp/radar.log 2>&1
+```
+
+可调阈值（环境变量）：
+
+```text
+RADAR_MIN_QUOTE_VOL       候选币 24h 成交额下限，默认 5,000,000
+RADAR_TOP_GAINERS         涨幅榜显示条数，默认 15
+RADAR_TOP_VOLATILE        振幅榜显示条数，默认 15
+RADAR_TREND_MIN_GAIN_PCT  A 类趋势涨幅下限，默认 5.0
+RADAR_TREND_MIN_AMP_PCT   A 类趋势振幅下限，默认 15.0
+RADAR_CRASH_MAX_LOSS_PCT  B 类暴雷跌幅上限（负数），默认 -10.0
+RADAR_CRASH_MIN_AMP_PCT   B 类暴雷振幅下限，默认 30.0
+RADAR_WECOM_TOP_N         推送时每个桶的最大行数，默认 8
+EXTRA_HYPE_KEYWORDS       手动补充进 C 类的币种，逗号分隔
+WECOM_KEY                 企业微信群机器人 key，留空则 DRY-RUN
+```
 
 ## 配置
 
