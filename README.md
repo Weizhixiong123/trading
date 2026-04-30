@@ -11,6 +11,7 @@ trading/
 ├─ src/
 │  ├─ binance_monitor.py
 │  ├─ hype_radar.py
+│  ├─ hype_form.py
 │  └─ signal_screener.py
 ├─ tests/
 ├─ .gitignore
@@ -116,6 +117,32 @@ SCREEN_SHORT_RSI_LO/HI    做空 RSI 窗口，默认 35 / 60
 SCREEN_HOT_RSI            过热 RSI 阈值（路由到回踩观察），默认 65
 SCREEN_COLD_RSI           超卖 RSI 阈值（路由到反弹观察），默认 35
 SCREEN_TOP_N              每桶推送条数，默认 5
+```
+
+## 热点币 4H 形态 hype_form.py
+
+只对 `hype_radar` 圈出的热点币（CoinGecko trending + 可选 `EXTRA_HYPE_KEYWORDS`）做
+4H 形态快照——**不下推荐，只描述现状**。每个币给出：
+
+- **形态分组**：完整多头 (20>50>100>200) / 完整空头 / 转折中 / 震荡
+- **距 EMA20**：短期偏离 (signed %)
+- **20 根位置**：当前价在最近 20 根 4H 高低区间的位置 (0-100%)
+- **RSI(14)**
+- **量能**：近 3 根均量 vs 前 20 根 → 扩量 / 平量 / 缩量
+- **最近 3 根 4H**：颜色组合 (G=阳, R=阴, D=十字)
+
+```bash
+python3 src/hype_form.py
+EXTRA_HYPE_KEYWORDS="LUNC,MEME" python3 src/hype_form.py
+```
+
+合约优先取数（更好的杠杆条件），合约没有时退到现货，两者都没有列入"未上币安"。
+跑一次 5–10 秒（只看 ~15 个热点币）。
+
+```text
+FORM_KLINE_INTERVAL       K 线周期，默认 4h
+FORM_KLINE_LIMIT          拉取根数，默认 250
+FORM_CONCURRENCY          并发抓 K 线，默认 15
 ```
 
 ## 配置
