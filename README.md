@@ -10,7 +10,8 @@ trading/
 │  └─ .env.example
 ├─ src/
 │  ├─ binance_monitor.py
-│  └─ hype_radar.py
+│  ├─ hype_radar.py
+│  └─ signal_screener.py
 ├─ tests/
 ├─ .gitignore
 ├─ README.md
@@ -82,6 +83,39 @@ RADAR_CRASH_MIN_AMP_PCT   B 类暴雷振幅下限，默认 30.0
 RADAR_WECOM_TOP_N         推送时每个桶的最大行数，默认 8
 EXTRA_HYPE_KEYWORDS       手动补充进 C 类的币种，逗号分隔
 WECOM_KEY                 企业微信群机器人 key，留空则 DRY-RUN
+```
+
+## 4H 信号筛选 signal_screener.py
+
+把 `hype_radar` 圈出的「值得看」升级为「**该怎么操作**」。逻辑：扫全部成交额过线的
+U 本位合约 4H K 线，用 EMA20/50/100/200 + RSI(14) + 量比，分四个桶：
+
+- **做多**：完整多头排列 + RSI [40,65] + 距 EMA20 ∈ [0,12]% + 量比 ≥ 1.2 → **现在可建仓**
+- **做空**：完整空头排列 + RSI [35,60] + 距 EMA20 ∈ [-12,0]% + 量比 ≥ 1.2 → **现在可建仓**
+- **回踩多观察**：完整多头但 RSI > 65 或距 EMA20 > 12% → **等回踩 EMA20/50**
+- **反弹空观察**：完整空头但 RSI < 35 或距 EMA20 < -12% → **等反弹到 EMA20/50**
+
+打分维度：EMA 排列(40) + 距 EMA20(20) + 量比(20) + RSI 位置(20)，每桶取 TOP 5 推送。
+指标全部用**已收盘**的 4H bar 计算（避开当前进行中的 bar 噪音）。
+
+```bash
+python3 src/signal_screener.py
+```
+
+可调参数（环境变量）：
+
+```text
+SCREEN_KLINE_INTERVAL     K 线周期，默认 4h
+SCREEN_KLINE_LIMIT        拉取根数（要 ≥ 200 才能算 EMA200），默认 250
+SCREEN_MIN_QUOTE_VOL      候选币 24h 成交额下限，默认 5,000,000
+SCREEN_CONCURRENCY        并发抓 K 线，默认 20
+SCREEN_MAX_DIST_PCT       距 EMA20 过滤上限，默认 12.0
+SCREEN_MIN_VOL_RATIO      量比下限，默认 1.2
+SCREEN_LONG_RSI_LO/HI     做多 RSI 窗口，默认 40 / 65
+SCREEN_SHORT_RSI_LO/HI    做空 RSI 窗口，默认 35 / 60
+SCREEN_HOT_RSI            过热 RSI 阈值（路由到回踩观察），默认 65
+SCREEN_COLD_RSI           超卖 RSI 阈值（路由到反弹观察），默认 35
+SCREEN_TOP_N              每桶推送条数，默认 5
 ```
 
 ## 配置
