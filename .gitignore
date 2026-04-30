@@ -9,3 +9,5 @@ configs/.env
 
 *.log
 logs/
+
+.runtime/

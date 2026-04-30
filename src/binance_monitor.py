@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
 """
-币安现货 + U本位永续合约 异动监控,推送到企业微信群机器人
+Binance USDT-M futures 4H structure monitor, with WeCom bot alerts.
 
-信号逻辑:
-  现货:5m涨幅 ≥ 阈值 + 5m成交量 > 过去1h均值 N 倍
-  合约:5m涨幅 ≥ 阈值 + OI 5m 增量 ≥ 阈值
-  共振(A级):同币种现货+合约同时命中 → 最强信号
-  单边(B级):仅一边命中
-  冷却:同币种 30 分钟内不重复推送
+Signal logic:
+  A level: 4H breakout/start signal + volume expansion + OI growth
+  B level: 4H trend setup signal, useful as a watchlist candidate
+  Cooldown: avoid repeated alerts for the same symbol within the cooldown window
 
-使用:
+Usage:
   cp configs/.env.example configs/.env
-  编辑 configs/.env
+  edit configs/.env
   python3 src/binance_monitor.py
 """
 import os
 import time
-import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple, Dict, List
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional
+
+import requests
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -35,9 +34,7 @@ def load_env_file(path: Path) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(key, value)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
 def env_int(name: str, default: int) -> int:
@@ -50,32 +47,54 @@ def env_float(name: str, default: float) -> float:
 
 load_env_file(Path(os.getenv("CONFIG_FILE", DEFAULT_CONFIG_FILE)))
 
-# ============ 配置 ============
-WECOM_WEBHOOK_KEY   = os.getenv("WECOM_KEY", "PUT_YOUR_WECOM_KEY_HERE")
+# ============ General config ============
+WECOM_WEBHOOK_KEY = os.getenv("WECOM_KEY", "PUT_YOUR_WECOM_KEY_HERE")
 
-SCAN_INTERVAL_SEC   = env_int("SCAN_INTERVAL_SEC", 60)
-ALERT_COOLDOWN_SEC  = env_int("ALERT_COOLDOWN_SEC", 1800)
+SCAN_INTERVAL_SEC = env_int("SCAN_INTERVAL_SEC", 300)
+ALERT_COOLDOWN_SEC = env_int("ALERT_COOLDOWN_SEC", 14400)
+REQ_TIMEOUT = env_int("REQ_TIMEOUT", 8)
+CONCURRENCY = env_int("CONCURRENCY", 30)
 
-MIN_24H_QUOTE_VOL   = env_float("MIN_24H_QUOTE_VOL", 1_000_000)  # 24h 成交额下限 (USDT)
-TOP_N_BY_VOLUME     = env_int("TOP_N_BY_VOLUME", 150)            # 每个市场只扫 24h 成交额前 N
-CONCURRENCY         = env_int("CONCURRENCY", 40)                 # 并发请求数
+MIN_24H_QUOTE_VOL = env_float("MIN_24H_QUOTE_VOL", 5_000_000)
+TOP_N_BY_VOLUME = env_int("TOP_N_BY_VOLUME", 180)
+MAX_24H_PRICE_PCT = env_float("MAX_24H_PRICE_PCT", 35.0)
 
-# 现货信号
-SPOT_PRICE_5M_PCT   = env_float("SPOT_PRICE_5M_PCT", 2.0)
-SPOT_VOL_5M_RATIO   = env_float("SPOT_VOL_5M_RATIO", 3.0)
+KLINE_INTERVAL = os.getenv("KLINE_INTERVAL", "4h")
+KLINE_LIMIT = env_int("KLINE_LIMIT", 120)
+STRUCTURE_LOOKBACK = env_int("STRUCTURE_LOOKBACK", 20)
+EMA_FAST_PERIOD = env_int("EMA_FAST_PERIOD", 20)
+EMA_MID_PERIOD = env_int("EMA_MID_PERIOD", 50)
+EMA_SLOW_PERIOD = env_int("EMA_SLOW_PERIOD", 100)
 
-# 合约信号
-FUT_PRICE_5M_PCT    = env_float("FUT_PRICE_5M_PCT", 2.0)
-FUT_OI_5M_PCT       = env_float("FUT_OI_5M_PCT", 3.0)
+# ============ 4H signal config ============
+A_MIN_4H_PRICE_PCT = env_float("A_MIN_4H_PRICE_PCT", 2.0)
+A_MAX_4H_PRICE_PCT = env_float("A_MAX_4H_PRICE_PCT", 8.0)
+A_MIN_4H_VOL_RATIO = env_float("A_MIN_4H_VOL_RATIO", 1.5)
+A_MAX_DIST_ABOVE_EMA_FAST_PCT = env_float("A_MAX_DIST_ABOVE_EMA_FAST_PCT", 12.0)
+A_MIN_OI_4H_PCT = env_float("A_MIN_OI_4H_PCT", 2.0)
 
-REQ_TIMEOUT         = env_int("REQ_TIMEOUT", 8)
-SPOT_API            = "https://api.binance.com"
-FAPI                = "https://fapi.binance.com"
-# =============================
+B_MAX_4H_PRICE_PCT = env_float("B_MAX_4H_PRICE_PCT", 4.0)
+B_MIN_4H_VOL_RATIO = env_float("B_MIN_4H_VOL_RATIO", 0.8)
+B_MAX_DIST_ABOVE_EMA_FAST_PCT = env_float("B_MAX_DIST_ABOVE_EMA_FAST_PCT", 6.0)
+B_EMA_MID_TOLERANCE_PCT = env_float("B_EMA_MID_TOLERANCE_PCT", 1.0)
+B_MIN_DIST_TO_HIGH_PCT = env_float("B_MIN_DIST_TO_HIGH_PCT", 5.0)
+B_MAX_DIST_TO_HIGH_PCT = env_float("B_MAX_DIST_TO_HIGH_PCT", 20.0)
+B_MAX_24H_PRICE_PCT = env_float("B_MAX_24H_PRICE_PCT", 12.0)
 
-last_alert_at = {}  # type: Dict[str, float]
+C_MAX_DIST_TO_HIGH_PCT = env_float("C_MAX_DIST_TO_HIGH_PCT", 5.0)
+C_MIN_DIST_ABOVE_EMA_FAST_PCT = env_float("C_MIN_DIST_ABOVE_EMA_FAST_PCT", 8.0)
+C_MAX_DIST_ABOVE_EMA_FAST_PCT = env_float("C_MAX_DIST_ABOVE_EMA_FAST_PCT", 25.0)
+C_MAX_24H_PRICE_PCT = env_float("C_MAX_24H_PRICE_PCT", 30.0)
+WARN_DIST_ABOVE_EMA_FAST_PCT = env_float("WARN_DIST_ABOVE_EMA_FAST_PCT", 20.0)
+MAX_DIST_ABOVE_EMA_FAST_PCT = env_float("MAX_DIST_ABOVE_EMA_FAST_PCT", 35.0)
+MAX_ABS_FUNDING_PCT = env_float("MAX_ABS_FUNDING_PCT", 0.25)
+
+FAPI = "https://fapi.binance.com"
+# ==========================================
+
+last_alert_at: Dict[str, float] = {}
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "binance-monitor/1.0"})
+SESSION.headers.update({"User-Agent": "binance-4h-monitor/1.0"})
 _adapter = requests.adapters.HTTPAdapter(pool_connections=64, pool_maxsize=64)
 SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
@@ -97,9 +116,9 @@ def push_wecom(title: str, content: str) -> None:
             timeout=REQ_TIMEOUT,
         )
         if r.json().get("errcode") != 0:
-            log(f"推送失败: {r.text}")
+            log(f"Push failed: {r.text}")
     except Exception as e:
-        log(f"推送异常: {e}")
+        log(f"Push exception: {e}")
 
 
 def can_alert(key: str) -> bool:
@@ -110,92 +129,49 @@ def can_alert(key: str) -> bool:
     return False
 
 
-def is_leveraged_token(sym: str) -> bool:
-    return any(x in sym for x in ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"])
-
-
-def get_candidates(url: str, leveraged_filter: bool) -> List[dict]:
-    r = SESSION.get(url, timeout=REQ_TIMEOUT)
+def get_futures_candidates() -> List[dict]:
+    r = SESSION.get(f"{FAPI}/fapi/v1/ticker/24hr", timeout=REQ_TIMEOUT)
     data = r.json()
     out = []
     for d in data:
-        if not d["symbol"].endswith("USDT"):
+        symbol = d.get("symbol", "")
+        if not symbol.endswith("USDT"):
             continue
-        if leveraged_filter and is_leveraged_token(d["symbol"]):
+        quote_volume = float(d.get("quoteVolume", 0))
+        price_24h = float(d.get("priceChangePercent", 0))
+        if quote_volume < MIN_24H_QUOTE_VOL:
             continue
-        if float(d["quoteVolume"]) < MIN_24H_QUOTE_VOL:
+        if price_24h > MAX_24H_PRICE_PCT:
             continue
         out.append(d)
     out.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
     return out[:TOP_N_BY_VOLUME]
 
 
-def fetch_5m_klines(base_url: str, symbol: str, kline_path: str) -> Optional[Tuple[float, float, float]]:
-    """返回 (5m涨幅%, 5m量比, 现价);量比 = 当前5m成交额 / 过去1h均值"""
+def fetch_klines(symbol: str) -> Optional[List[list]]:
     r = SESSION.get(
-        f"{base_url}{kline_path}",
-        params={"symbol": symbol, "interval": "5m", "limit": 13},
+        f"{FAPI}/fapi/v1/klines",
+        params={"symbol": symbol, "interval": KLINE_INTERVAL, "limit": KLINE_LIMIT},
         timeout=REQ_TIMEOUT,
     )
-    kl = r.json()
-    if not isinstance(kl, list) or len(kl) < 13:
+    data = r.json()
+    min_len = max(STRUCTURE_LOOKBACK, EMA_SLOW_PERIOD) + 1
+    if not isinstance(data, list) or len(data) < min_len:
         return None
-    curr = kl[-1]
-    open_p, close_p, qvol = float(curr[1]), float(curr[4]), float(curr[7])
-    prev_qvols = [float(k[7]) for k in kl[-13:-1]]
-    avg = sum(prev_qvols) / len(prev_qvols)
-    if open_p == 0 or avg == 0:
-        return None
-    price_pct = (close_p / open_p - 1) * 100
-    vol_ratio = qvol / avg
-    return price_pct, vol_ratio, close_p
+    return data
 
 
-def check_spot(symbol: str, vol_24h: float, price_24h: float) -> Optional[dict]:
-    try:
-        kl = fetch_5m_klines(SPOT_API, symbol, "/api/v3/klines")
-        if not kl:
-            return None
-        price_pct, vol_ratio, price = kl
-        if price_pct >= SPOT_PRICE_5M_PCT and vol_ratio >= SPOT_VOL_5M_RATIO:
-            return {
-                "symbol": symbol, "price_5m": price_pct, "vol_ratio": vol_ratio,
-                "price": price, "vol_24h_m": vol_24h / 1e6, "price_24h": price_24h,
-            }
-    except Exception:
-        pass
-    return None
-
-
-def check_fut_price(symbol, vol_24h, price_24h):
-    """第一阶段:只判断价格,通过后再查 OI"""
-    try:
-        kl = fetch_5m_klines(FAPI, symbol, "/fapi/v1/klines")
-        if not kl:
-            return None
-        price_pct, vol_ratio, price = kl
-        if price_pct >= FUT_PRICE_5M_PCT:
-            return {
-                "symbol": symbol, "price_5m": price_pct, "vol_ratio": vol_ratio,
-                "price": price, "vol_24h_m": vol_24h / 1e6, "price_24h": price_24h,
-            }
-    except Exception:
-        pass
-    return None
-
-
-def fetch_oi_pct(symbol):
-    """返回 OI 5m 增长 %"""
+def fetch_oi_pct(symbol: str) -> float:
     try:
         r = SESSION.get(
             f"{FAPI}/futures/data/openInterestHist",
-            params={"symbol": symbol, "period": "5m", "limit": 2},
+            params={"symbol": symbol, "period": KLINE_INTERVAL, "limit": 2},
             timeout=REQ_TIMEOUT,
         )
-        oi = r.json()
-        if isinstance(oi, list) and len(oi) >= 2:
-            prev = float(oi[0]["sumOpenInterest"])
-            curr = float(oi[-1]["sumOpenInterest"])
+        data = r.json()
+        if isinstance(data, list) and len(data) >= 2:
+            prev = float(data[0]["sumOpenInterest"])
+            curr = float(data[-1]["sumOpenInterest"])
             if prev > 0:
                 return (curr / prev - 1) * 100
     except Exception:
@@ -203,8 +179,7 @@ def fetch_oi_pct(symbol):
     return 0.0
 
 
-def fetch_all_funding():
-    """一次拉所有合约资金费率,返回 {symbol: funding_pct}"""
+def fetch_all_funding() -> Dict[str, float]:
     try:
         r = SESSION.get(f"{FAPI}/fapi/v1/premiumIndex", timeout=REQ_TIMEOUT)
         return {d["symbol"]: float(d.get("lastFundingRate", 0)) * 100 for d in r.json()}
@@ -212,100 +187,227 @@ def fetch_all_funding():
         return {}
 
 
+def average(values: List[float]) -> float:
+    return sum(values) / len(values)
+
+
+def ema(values: List[float], period: int) -> float:
+    multiplier = 2 / (period + 1)
+    value = average(values[:period])
+    for price in values[period:]:
+        value = (price - value) * multiplier + value
+    return value
+
+
+def ema_note(level: str) -> str:
+    if level == "A":
+        return "A级已启动, 不追高; 等回踩EMA20/50不破再找右侧多点"
+    if level == "B":
+        return "B级低位蓄势, EMA20/50不破时最适合观察做多"
+    return "C级高位观察, 只看回踩EMA20/50后的修复, 不追高"
+
+
+def analyze_4h(symbol: str, vol_24h: float, price_24h: float, funding: float) -> Optional[dict]:
+    try:
+        klines = fetch_klines(symbol)
+        if not klines:
+            return None
+
+        closes = [float(k[4]) for k in klines]
+        highs = [float(k[2]) for k in klines]
+        lows = [float(k[3]) for k in klines]
+        quote_volumes = [float(k[7]) for k in klines]
+        curr = klines[-1]
+        prev = klines[-2]
+
+        open_p = float(curr[1])
+        high_p = float(curr[2])
+        low_p = float(curr[3])
+        close_p = float(curr[4])
+        prev_close = float(prev[4])
+        if open_p <= 0 or prev_close <= 0:
+            return None
+
+        ema_fast = ema(closes, EMA_FAST_PERIOD)
+        ema_mid = ema(closes, EMA_MID_PERIOD)
+        ema_slow = ema(closes, EMA_SLOW_PERIOD)
+        high_n = max(highs[-STRUCTURE_LOOKBACK:])
+        low_n = min(lows[-STRUCTURE_LOOKBACK:])
+        avg_vol = average(quote_volumes[-STRUCTURE_LOOKBACK - 1:-1])
+        if ema_fast <= 0 or ema_mid <= 0 or ema_slow <= 0 or high_n <= 0 or low_n <= 0 or avg_vol <= 0:
+            return None
+
+        candle_pct = (close_p / open_p - 1) * 100
+        change_vs_prev = (close_p / prev_close - 1) * 100
+        vol_ratio = quote_volumes[-1] / avg_vol
+        pos_vs_ema_fast = (close_p / ema_fast - 1) * 100
+        pos_vs_ema_mid = (close_p / ema_mid - 1) * 100
+        pos_vs_ema_slow = (close_p / ema_slow - 1) * 100
+        dist_to_high = (high_n / close_p - 1) * 100
+        dist_to_low = (close_p / low_n - 1) * 100
+        oi_pct = fetch_oi_pct(symbol)
+
+        above_trend = close_p > ema_fast > ema_mid
+        low_base_trend = close_p > ema_fast and ema_fast >= ema_mid * 0.98
+        startup_zone = pos_vs_ema_fast <= A_MAX_DIST_ABOVE_EMA_FAST_PCT
+        base_zone = pos_vs_ema_fast <= B_MAX_DIST_ABOVE_EMA_FAST_PCT
+        ema_mid_hold = low_p >= ema_mid * (1 - B_EMA_MID_TOLERANCE_PCT / 100)
+        pullback_room = B_MIN_DIST_TO_HIGH_PCT <= dist_to_high <= B_MAX_DIST_TO_HIGH_PCT
+        near_high = 0 <= dist_to_high <= C_MAX_DIST_TO_HIGH_PCT
+        high_breakout_zone = (
+            C_MIN_DIST_ABOVE_EMA_FAST_PCT <= pos_vs_ema_fast <= C_MAX_DIST_ABOVE_EMA_FAST_PCT
+        )
+        not_overextended = pos_vs_ema_fast <= MAX_DIST_ABOVE_EMA_FAST_PCT
+        overheat_warning = pos_vs_ema_fast >= WARN_DIST_ABOVE_EMA_FAST_PCT
+        sane_24h = price_24h <= MAX_24H_PRICE_PCT
+        sane_funding = abs(funding) <= MAX_ABS_FUNDING_PCT
+
+        a_signal = (
+            above_trend
+            and not_overextended
+            and startup_zone
+            and sane_24h
+            and sane_funding
+            and A_MIN_4H_PRICE_PCT <= candle_pct <= A_MAX_4H_PRICE_PCT
+            and vol_ratio >= A_MIN_4H_VOL_RATIO
+            and oi_pct >= A_MIN_OI_4H_PCT
+        )
+        b_signal = (
+            low_base_trend
+            and not_overextended
+            and base_zone
+            and ema_mid_hold
+            and pullback_room
+            and price_24h <= B_MAX_24H_PRICE_PCT
+            and sane_funding
+            and 0 < candle_pct <= B_MAX_4H_PRICE_PCT
+            and change_vs_prev > 0
+            and vol_ratio >= B_MIN_4H_VOL_RATIO
+            and oi_pct > 0
+        )
+        c_signal = (
+            above_trend
+            and not_overextended
+            and near_high
+            and high_breakout_zone
+            and price_24h <= C_MAX_24H_PRICE_PCT
+            and sane_funding
+            and candle_pct > 0
+            and change_vs_prev > 0
+            and (vol_ratio >= 1.0 or oi_pct > 0)
+        )
+        if not a_signal and not b_signal and not c_signal:
+            return None
+
+        level = "A" if a_signal else "B" if b_signal else "C"
+
+        return {
+            "level": level,
+            "symbol": symbol,
+            "price": close_p,
+            "high": high_p,
+            "low": low_p,
+            "candle_pct": candle_pct,
+            "change_vs_prev": change_vs_prev,
+            "vol_ratio": vol_ratio,
+            "oi_pct": oi_pct,
+            "funding": funding,
+            "price_24h": price_24h,
+            "vol_24h_m": vol_24h / 1e6,
+            "ema_fast": ema_fast,
+            "ema_mid": ema_mid,
+            "ema_slow": ema_slow,
+            "pos_vs_ema_fast": pos_vs_ema_fast,
+            "pos_vs_ema_mid": pos_vs_ema_mid,
+            "pos_vs_ema_slow": pos_vs_ema_slow,
+            "overheat_warning": overheat_warning,
+            "ema_note": ema_note(level),
+            "high_n": high_n,
+            "low_n": low_n,
+            "dist_to_high": dist_to_high,
+            "dist_to_low": dist_to_low,
+        }
+    except Exception as e:
+        log(f"{symbol} analyze failed: {e}")
+        return None
+
+
+def format_signal(sig: dict) -> str:
+    risk_note = ""
+    if sig["overheat_warning"]:
+        risk_note = f"\n> 风险: 价格高于EMA{EMA_FAST_PERIOD} {sig['pos_vs_ema_fast']:.2f}%, 偏高位加速"
+    return (
+        f"> 现价: `{sig['price']}`  24h: **{sig['price_24h']:+.2f}%**\n"
+        f"> 4H: **{sig['candle_pct']:+.2f}%**  较前收: {sig['change_vs_prev']:+.2f}%\n"
+        f"> 4H量比: **{sig['vol_ratio']:.2f}x**  OI({KLINE_INTERVAL}): **{sig['oi_pct']:+.2f}%**\n"
+        f"> EMA{EMA_FAST_PERIOD}: {sig['ema_fast']:.8g}  EMA{EMA_MID_PERIOD}: {sig['ema_mid']:.8g}  "
+        f"EMA{EMA_SLOW_PERIOD}: {sig['ema_slow']:.8g}\n"
+        f"> 距EMA{EMA_FAST_PERIOD}: {sig['pos_vs_ema_fast']:+.2f}%  "
+        f"距EMA{EMA_MID_PERIOD}: {sig['pos_vs_ema_mid']:+.2f}%\n"
+        f"> 距{STRUCTURE_LOOKBACK}根4H高点: {sig['dist_to_high']:.2f}%  "
+        f"距低点: {sig['dist_to_low']:.2f}%\n"
+        f"> 资金费率: {sig['funding']:+.4f}%  24h成交额: {sig['vol_24h_m']:.1f}M U\n"
+        f"> 备注: {sig['ema_note']}"
+        f"{risk_note}"
+    )
+
+
 def scan_once() -> None:
-    spot_cands = get_candidates(f"{SPOT_API}/api/v3/ticker/24hr", leveraged_filter=True)
-    fut_cands = get_candidates(f"{FAPI}/fapi/v1/ticker/24hr", leveraged_filter=False)
-    log(f"扫描候选 现货:{len(spot_cands)} 合约:{len(fut_cands)}")
-
-    spot_hits = {}   # type: Dict[str, dict]
-    fut_price_hits = {}  # type: Dict[str, dict]
-
-    # 第一阶段:并发拉所有 K 线,价格筛选
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
-        sf = {ex.submit(check_spot, c["symbol"], float(c["quoteVolume"]),
-                        float(c["priceChangePercent"])): c["symbol"] for c in spot_cands}
-        ff = {ex.submit(check_fut_price, c["symbol"], float(c["quoteVolume"]),
-                       float(c["priceChangePercent"])): c["symbol"] for c in fut_cands}
-        for fut in as_completed(sf):
-            r = fut.result()
-            if r:
-                spot_hits[r["symbol"]] = r
-        for fut in as_completed(ff):
-            r = fut.result()
-            if r:
-                fut_price_hits[r["symbol"]] = r
-
-    # 第二阶段:只对通过价格筛选的合约币查 OI(数量少,几个到几十个)
-    fut_hits = {}    # type: Dict[str, dict]
+    candidates = get_futures_candidates()
     funding_map = fetch_all_funding()
-    if fut_price_hits:
-        with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
-            of = {ex.submit(fetch_oi_pct, sym): sym for sym in fut_price_hits}
-            for fut in as_completed(of):
-                sym = of[fut]
-                oi_pct = fut.result()
-                if oi_pct >= FUT_OI_5M_PCT:
-                    sig = fut_price_hits[sym]
-                    sig["oi_5m"] = oi_pct
-                    sig["funding"] = funding_map.get(sym, 0.0)
-                    fut_hits[sym] = sig
+    log(f"扫描4H候选 合约:{len(candidates)}")
 
-    spot_bases = {s[:-4]: s for s in spot_hits}
-    fut_bases = {s[:-4]: s for s in fut_hits}
-    resonance = set(spot_bases) & set(fut_bases)
+    hits: List[dict] = []
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
+        futures = {
+            ex.submit(
+                analyze_4h,
+                c["symbol"],
+                float(c["quoteVolume"]),
+                float(c["priceChangePercent"]),
+                funding_map.get(c["symbol"], 0.0),
+            ): c["symbol"]
+            for c in candidates
+        }
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result:
+                hits.append(result)
 
-    # A级:共振
-    for base in sorted(resonance):
-        sym = f"{base}USDT"
-        if not can_alert(f"R:{sym}"):
+    level_order = {"A": 0, "B": 1, "C": 2}
+    hits.sort(key=lambda x: (level_order[x["level"]], -x["vol_ratio"], -x["oi_pct"]))
+
+    a_count = 0
+    b_count = 0
+    c_count = 0
+    for sig in hits:
+        key = f"{sig['level']}4H:{sig['symbol']}"
+        if not can_alert(key):
             continue
-        s, f = spot_hits[sym], fut_hits[sym]
-        push_wecom(
-            f"🔥 A级共振 {sym}",
-            f"**现货+合约同时异动**\n"
-            f"> 现货 5m: **{s['price_5m']:+.2f}%**  量比 {s['vol_ratio']:.1f}x\n"
-            f"> 合约 5m: **{f['price_5m']:+.2f}%**  OI **{f['oi_5m']:+.2f}%**  量比 {f['vol_ratio']:.1f}x\n"
-            f"> 资金费率: {f['funding']:+.4f}%\n"
-            f"> 现价: {f['price']}  24h: {f['price_24h']:+.2f}%\n"
-            f"> 24h 合约成交额: {f['vol_24h_m']:.1f}M U",
-        )
+        if sig["level"] == "A":
+            a_count += 1
+            title = f"A级4H启动 {sig['symbol']}"
+        elif sig["level"] == "B":
+            b_count += 1
+            title = f"B级4H蓄势 {sig['symbol']}"
+        else:
+            c_count += 1
+            title = f"C级4H高位观察 {sig['symbol']}"
+        push_wecom(title, format_signal(sig))
 
-    # B级:仅现货
-    for sym, sig in spot_hits.items():
-        if sym[:-4] in resonance or not can_alert(f"S:{sym}"):
-            continue
-        push_wecom(
-            f"📈 现货异动 {sym}",
-            f"> 5m: **{sig['price_5m']:+.2f}%**  量比 {sig['vol_ratio']:.1f}x\n"
-            f"> 现价: {sig['price']}  24h: {sig['price_24h']:+.2f}%\n"
-            f"> 24h 成交额: {sig['vol_24h_m']:.1f}M U",
-        )
-
-    # B级:仅合约
-    for sym, sig in fut_hits.items():
-        if sym[:-4] in resonance or not can_alert(f"F:{sym}"):
-            continue
-        push_wecom(
-            f"📊 合约异动 {sym}",
-            f"> 5m: **{sig['price_5m']:+.2f}%**  OI **{sig['oi_5m']:+.2f}%**\n"
-            f"> 量比 {sig['vol_ratio']:.1f}x  资金费率 {sig['funding']:+.4f}%\n"
-            f"> 现价: {sig['price']}  24h: {sig['price_24h']:+.2f}%\n"
-            f"> 24h 成交额: {sig['vol_24h_m']:.1f}M U",
-        )
-
-    log(f"命中 现货:{len(spot_hits)} 合约:{len(fut_hits)} 共振:{len(resonance)}")
+    log(f"命中4H A:{a_count} B:{b_count} C:{c_count} 总:{len(hits)}")
 
 
 def main() -> None:
-    log("启动监控")
+    log("启动4H监控")
     if WECOM_WEBHOOK_KEY.startswith("PUT_"):
-        log("⚠️ 未配置 WECOM_KEY 环境变量,以 DRY-RUN 模式运行(只打印,不推送)")
+        log("未配置 WECOM_KEY 环境变量,以 DRY-RUN 模式运行(只打印,不推送)")
     while True:
         try:
             t0 = time.time()
             scan_once()
             elapsed = time.time() - t0
-            sleep_s = max(5, SCAN_INTERVAL_SEC - elapsed)
+            sleep_s = max(30, SCAN_INTERVAL_SEC - elapsed)
             log(f"耗时 {elapsed:.1f}s,休眠 {sleep_s:.0f}s")
             time.sleep(sleep_s)
         except KeyboardInterrupt:
@@ -313,7 +415,7 @@ def main() -> None:
             break
         except Exception as e:
             log(f"循环异常: {e}")
-            time.sleep(10)
+            time.sleep(30)
 
 
 if __name__ == "__main__":
