@@ -21,15 +21,19 @@ to the same WeCom webhook used by binance_monitor.
 Usage:
   python3 src/hype_form.py
   EXTRA_HYPE_KEYWORDS="LUNC,MEME" python3 src/hype_form.py
+  FORM_RUN_ONCE=1 python3 src/hype_form.py
 """
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import requests
+
+from hype_sources import get_hype_symbols
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -57,12 +61,15 @@ SPOT_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr"
 FUTURES_TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
 SPOT_KLINES_URL = "https://api.binance.com/api/v3/klines"
 FUTURES_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
-COINGECKO_TRENDING_URL = "https://api.coingecko.com/api/v3/search/trending"
-
 KLINE_INTERVAL = os.getenv("FORM_KLINE_INTERVAL", "4h")
 KLINE_LIMIT = env_int("FORM_KLINE_LIMIT", 250)
 CONCURRENCY = env_int("FORM_CONCURRENCY", 15)
 REQ_TIMEOUT = env_int("REQ_TIMEOUT", 10)
+FORM_INTERVAL_SEC = env_int("FORM_INTERVAL_SEC", 900)
+FORM_RUN_ONCE = os.getenv("FORM_RUN_ONCE", "0") == "1"
+STRONG_LONG_RSI_LO = env_int("FORM_STRONG_LONG_RSI_LO", 60)
+STRONG_LONG_RSI_HI = env_int("FORM_STRONG_LONG_RSI_HI", 68)
+STRONG_LONG_MAX_DIST = env_int("FORM_STRONG_LONG_MAX_DIST", 10)
 
 WECOM_WEBHOOK_KEY = os.getenv("WECOM_KEY", "PUT_YOUR_WECOM_KEY_HERE")
 WECOM_MAX_CONTENT = 3800
@@ -84,11 +91,13 @@ FORM_ORDER = (FORM_BULL, FORM_BEAR, FORM_TURN, FORM_RANGE)
 class FormReport:
     __slots__ = (
         "rank", "base", "symbol", "market", "form", "price", "ema20", "rsi",
-        "dist_pct", "range_pos", "vol_trend", "vol_ratio", "candles", "chg24h",
+        "dist_pct", "range_pos", "h20", "l20", "vol_trend", "vol_ratio",
+        "candles", "chg24h",
     )
 
     def __init__(self, rank, base, symbol, market, form, price, ema20, rsi,
-                 dist_pct, range_pos, vol_trend, vol_ratio, candles, chg24h):
+                 dist_pct, range_pos, h20, l20, vol_trend, vol_ratio,
+                 candles, chg24h):
         self.rank = rank
         self.base = base
         self.symbol = symbol
@@ -99,6 +108,8 @@ class FormReport:
         self.rsi = rsi
         self.dist_pct = dist_pct
         self.range_pos = range_pos
+        self.h20 = h20
+        self.l20 = l20
         self.vol_trend = vol_trend
         self.vol_ratio = vol_ratio
         self.candles = candles
@@ -158,35 +169,6 @@ def candle_signature(opens: List[float], closes: List[float]) -> str:
         else:
             out.append("D")
     return "".join(out)
-
-
-def fetch_coingecko_trending() -> List[Tuple[int, str]]:
-    resp = requests.get(COINGECKO_TRENDING_URL, timeout=REQ_TIMEOUT,
-                        headers={"accept": "application/json"})
-    resp.raise_for_status()
-    out: List[Tuple[int, str]] = []
-    seen: set = set()
-    for i, c in enumerate(resp.json().get("coins", []), 1):
-        item = c.get("item") or {}
-        sym = (item.get("symbol") or "").upper().strip()
-        if sym and sym not in seen:
-            seen.add(sym)
-            out.append((i, sym))
-    return out
-
-
-def load_extras() -> List[str]:
-    raw = os.getenv("EXTRA_HYPE_KEYWORDS", "").strip()
-    if not raw:
-        return []
-    seen: set = set()
-    out: List[str] = []
-    for x in raw.replace("\n", ",").split(","):
-        k = x.strip().upper()
-        if k and k not in seen:
-            seen.add(k)
-            out.append(k)
-    return out
 
 
 def fetch_tradable_pairs() -> Tuple[Dict[str, float], Dict[str, float]]:
@@ -266,8 +248,9 @@ def analyze(rank: int, base: str, market: str, symbol: str,
     return FormReport(
         rank=rank, base=base, symbol=symbol, market=market, form=form,
         price=price_live, ema20=e20, rsi=r, dist_pct=dist_pct,
-        range_pos=range_pos, vol_trend=vol_trend, vol_ratio=vol_ratio,
-        candles=candle_signature(opens, closes), chg24h=chg24h,
+        range_pos=range_pos, h20=h20, l20=l20, vol_trend=vol_trend,
+        vol_ratio=vol_ratio, candles=candle_signature(opens, closes),
+        chg24h=chg24h,
     )
 
 
@@ -318,6 +301,53 @@ def md_section(form: str, items: List[FormReport]) -> str:
     return f'<font color="{color}">**【{form}】 {len(items)}**</font>\n' + "\n".join(lines) + "\n"
 
 
+def strong_long_items(reports: List[FormReport]) -> List[FormReport]:
+    out = [
+        r for r in reports
+        if r.form == FORM_BULL
+        and STRONG_LONG_RSI_LO <= r.rsi <= STRONG_LONG_RSI_HI
+        and 0 <= r.dist_pct <= STRONG_LONG_MAX_DIST
+    ]
+    return sorted(out, key=lambda r: (r.dist_pct, -r.vol_ratio, r.rank))
+
+
+def entry_zone(r: FormReport) -> str:
+    pullback_low = r.ema20
+    pullback_high = min(r.price, r.ema20 * 1.03)
+    if pullback_high < pullback_low:
+        pullback_high = pullback_low
+    breakout = r.h20
+    if r.range_pos >= 100:
+        return (
+            f"回踩 {fmt_price(pullback_low)}-{fmt_price(pullback_high)}; "
+            f"站稳 {fmt_price(breakout)}"
+        )
+    return (
+        f"回踩 {fmt_price(pullback_low)}-{fmt_price(pullback_high)}; "
+        f"突破 {fmt_price(breakout)}"
+    )
+
+
+def md_strong_long(items: List[FormReport]) -> str:
+    if not items:
+        return ""
+    lines = []
+    for r in items:
+        lines.append(
+            f"> #{r.rank} `{r.base:<8}` {r.market:<3}  "
+            f"距EMA20 {r.dist_pct:>+5.1f}%  RSI {r.rsi:>4.1f}  "
+            f"{r.vol_trend}  位 {r.range_pos:>3.0f}%  24h {r.chg24h:>+5.1f}%\n"
+            f"> 开仓观察: {entry_zone(r)}"
+        )
+    return (
+        '<font color="warning">**强做多观察：RSI回落 + EMA20修复**</font>\n'
+        f"> 条件: RSI {STRONG_LONG_RSI_LO}-{STRONG_LONG_RSI_HI}, "
+        f"距EMA20 0-{STRONG_LONG_MAX_DIST}%\n"
+        + "\n".join(lines)
+        + "\n"
+    )
+
+
 def format_message(reports: List[FormReport], unmatched: List[Tuple[int, str]]) -> Tuple[str, str]:
     title = f"热点币 4H 形态  {datetime.now():%m-%d %H:%M}"
     by_form: Dict[str, List[FormReport]] = {f: [] for f in FORM_ORDER}
@@ -328,6 +358,9 @@ def format_message(reports: List[FormReport], unmatched: List[Tuple[int, str]]) 
 
     summary = " ".join(f"{f} {len(by_form[f])}" for f in FORM_ORDER)
     parts = [f"> 共 {len(reports)} 个: {summary}\n"]
+    strong_section = md_strong_long(strong_long_items(reports))
+    if strong_section:
+        parts.append(strong_section)
     for f in FORM_ORDER:
         parts.append(md_section(f, by_form[f]))
     if unmatched:
@@ -358,18 +391,34 @@ def push_wecom(title: str, content: str) -> None:
 
 
 def main() -> int:
+    if FORM_RUN_ONCE:
+        return run_once()
+
+    print(f"[form] starting loop, interval={FORM_INTERVAL_SEC}s", file=sys.stderr)
+    while True:
+        started = time.time()
+        try:
+            run_once()
+        except KeyboardInterrupt:
+            print("[form] stopped.", file=sys.stderr)
+            return 0
+        except Exception as e:
+            print(f"[form] loop exception: {e}", file=sys.stderr)
+        elapsed = time.time() - started
+        sleep_s = max(30, FORM_INTERVAL_SEC - elapsed)
+        print(f"[form] elapsed={elapsed:.1f}s sleep={sleep_s:.0f}s", file=sys.stderr)
+        time.sleep(sleep_s)
+
+
+def run_once() -> int:
     try:
-        trending = fetch_coingecko_trending()
+        hype_symbols = get_hype_symbols(REQ_TIMEOUT)
     except requests.RequestException as e:
         print(f"[form] CoinGecko fetch failed: {e}", file=sys.stderr)
         return 1
-    extras = load_extras()
-    targets: List[Tuple[int, str]] = list(trending)
-    next_rank = max((r for r, _ in trending), default=0) + 1
-    for k in extras:
-        if not any(b == k for _, b in targets):
-            targets.append((next_rank, k))
-            next_rank += 1
+    targets: List[Tuple[int, str]] = [
+        (idx, coin.symbol) for idx, coin in enumerate(hype_symbols, 1)
+    ]
 
     fut_map, spot_map = fetch_tradable_pairs()
 

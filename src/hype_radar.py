@@ -19,14 +19,18 @@ Output buckets:
 Usage:
   python3 src/hype_radar.py
   EXTRA_HYPE_KEYWORDS="LUNC,RUNE" python3 src/hype_radar.py   # add manual overrides
+  RADAR_RUN_ONCE=1 python3 src/hype_radar.py                  # run once
 """
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
+
+from hype_sources import TrendingCoin, fetch_coingecko_trending, load_extra_keywords
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -56,8 +60,6 @@ load_env_file(Path(os.getenv("CONFIG_FILE", DEFAULT_CONFIG_FILE)))
 
 SPOT_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr"
 FUTURES_TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-COINGECKO_TRENDING_URL = "https://api.coingecko.com/api/v3/search/trending"
-
 MIN_QUOTE_VOL = env_float("RADAR_MIN_QUOTE_VOL", 5_000_000)
 TOP_GAINERS = env_int("RADAR_TOP_GAINERS", 15)
 TOP_VOLATILE = env_int("RADAR_TOP_VOLATILE", 15)
@@ -71,6 +73,9 @@ REQ_TIMEOUT = env_int("REQ_TIMEOUT", 10)
 WECOM_WEBHOOK_KEY = os.getenv("WECOM_KEY", "PUT_YOUR_WECOM_KEY_HERE")
 WECOM_PUSH_TOP_N = env_int("RADAR_WECOM_TOP_N", 8)
 WECOM_MAX_CONTENT = 3800  # leave headroom under WeCom's 4096-byte cap
+RADAR_INTERVAL_SEC = env_int("RADAR_INTERVAL_SEC", 900)
+RADAR_RUN_ONCE = os.getenv("RADAR_RUN_ONCE", "0") == "1"
+RADAR_PUSH_WECOM = os.getenv("RADAR_PUSH_WECOM", "0") == "1"
 
 # Stablecoins / pegged assets — drift around 1.00, never interesting.
 STABLE_BASES = {
@@ -91,16 +96,6 @@ class Row:
         self.amp_pct = amp_pct
         self.last = last
         self.quote_vol = quote_vol
-
-
-class TrendingCoin:
-    __slots__ = ("symbol", "name", "mc_rank", "score")
-
-    def __init__(self, symbol: str, name: str, mc_rank: Optional[int], score: int):
-        self.symbol = symbol
-        self.name = name
-        self.mc_rank = mc_rank
-        self.score = score
 
 
 def fetch_ticker(url: str) -> List[Row]:
@@ -133,42 +128,6 @@ def fetch_ticker(url: str) -> List[Row]:
         except (KeyError, ValueError, TypeError):
             continue
     return rows
-
-
-def fetch_coingecko_trending() -> List[TrendingCoin]:
-    resp = requests.get(
-        COINGECKO_TRENDING_URL,
-        timeout=REQ_TIMEOUT,
-        headers={"accept": "application/json"},
-    )
-    resp.raise_for_status()
-    out: List[TrendingCoin] = []
-    for c in resp.json().get("coins", []):
-        item = c.get("item") or {}
-        sym = (item.get("symbol") or "").upper().strip()
-        if not sym:
-            continue
-        out.append(TrendingCoin(
-            symbol=sym,
-            name=item.get("name") or sym,
-            mc_rank=item.get("market_cap_rank"),
-            score=int(item.get("score") or 0),
-        ))
-    return out
-
-
-def load_extra_keywords() -> List[str]:
-    raw = os.getenv("EXTRA_HYPE_KEYWORDS", "").strip()
-    if not raw:
-        return []
-    seen: set = set()
-    out: List[str] = []
-    for x in raw.replace("\n", ",").split(","):
-        k = x.strip().upper()
-        if k and k not in seen:
-            seen.add(k)
-            out.append(k)
-    return out
 
 
 def fmt_price(p: float) -> str:
@@ -378,6 +337,26 @@ def push_wecom(title: str, content: str) -> None:
 
 
 def main() -> int:
+    if RADAR_RUN_ONCE:
+        return run_once()
+
+    print(f"[radar] starting loop, interval={RADAR_INTERVAL_SEC}s", file=sys.stderr)
+    while True:
+        started = time.time()
+        try:
+            run_once()
+        except KeyboardInterrupt:
+            print("[radar] stopped.", file=sys.stderr)
+            return 0
+        except Exception as e:
+            print(f"[radar] loop exception: {e}", file=sys.stderr)
+        elapsed = time.time() - started
+        sleep_s = max(30, RADAR_INTERVAL_SEC - elapsed)
+        print(f"[radar] elapsed={elapsed:.1f}s sleep={sleep_s:.0f}s", file=sys.stderr)
+        time.sleep(sleep_s)
+
+
+def run_once() -> int:
     try:
         spot = fetch_ticker(SPOT_TICKER_URL)
         fut = fetch_ticker(FUTURES_TICKER_URL)
@@ -387,7 +366,7 @@ def main() -> int:
 
     trending: List[TrendingCoin] = []
     try:
-        trending = fetch_coingecko_trending()
+        trending = fetch_coingecko_trending(REQ_TIMEOUT)
     except requests.RequestException as e:
         print(f"[radar] CoinGecko fetch failed: {e}", file=sys.stderr)
 
@@ -415,8 +394,11 @@ def main() -> int:
     )
     render_hype(trending, extras, merge_markets(spot, fut))
 
-    title, content = format_wecom_message(trending, spot, fut, trend, crash, extras)
-    push_wecom(title, content)
+    if RADAR_PUSH_WECOM:
+        title, content = format_wecom_message(trending, spot, fut, trend, crash, extras)
+        push_wecom(title, content)
+    else:
+        print("[radar] RADAR_PUSH_WECOM=0 — skipping WeCom push.", file=sys.stderr)
     return 0
 
 
