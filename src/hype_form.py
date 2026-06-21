@@ -67,9 +67,11 @@ CONCURRENCY = env_int("FORM_CONCURRENCY", 15)
 REQ_TIMEOUT = env_int("REQ_TIMEOUT", 10)
 FORM_INTERVAL_SEC = env_int("FORM_INTERVAL_SEC", 900)
 FORM_RUN_ONCE = os.getenv("FORM_RUN_ONCE", "0") == "1"
-STRONG_LONG_RSI_LO = env_int("FORM_STRONG_LONG_RSI_LO", 60)
-STRONG_LONG_RSI_HI = env_int("FORM_STRONG_LONG_RSI_HI", 68)
-STRONG_LONG_MAX_DIST = env_int("FORM_STRONG_LONG_MAX_DIST", 10)
+# 回踩做多: 完整多头里, RSI 回落到中性(45-55, 不追高) + 价格贴近 EMA20
+STRONG_LONG_RSI_LO = env_int("FORM_STRONG_LONG_RSI_LO", 45)
+STRONG_LONG_RSI_HI = env_int("FORM_STRONG_LONG_RSI_HI", 55)
+STRONG_LONG_MIN_DIST = env_int("FORM_STRONG_LONG_MIN_DIST", -3)
+STRONG_LONG_MAX_DIST = env_int("FORM_STRONG_LONG_MAX_DIST", 5)
 
 WECOM_WEBHOOK_KEY = os.getenv("WECOM_KEY", "PUT_YOUR_WECOM_KEY_HERE")
 WECOM_MAX_CONTENT = 3800
@@ -306,7 +308,7 @@ def strong_long_items(reports: List[FormReport]) -> List[FormReport]:
         r for r in reports
         if r.form == FORM_BULL
         and STRONG_LONG_RSI_LO <= r.rsi <= STRONG_LONG_RSI_HI
-        and 0 <= r.dist_pct <= STRONG_LONG_MAX_DIST
+        and STRONG_LONG_MIN_DIST <= r.dist_pct <= STRONG_LONG_MAX_DIST
     ]
     return sorted(out, key=lambda r: (r.dist_pct, -r.vol_ratio, r.rank))
 
@@ -340,9 +342,9 @@ def md_strong_long(items: List[FormReport]) -> str:
             f"> 开仓观察: {entry_zone(r)}"
         )
     return (
-        '<font color="warning">**强做多观察：RSI回落 + EMA20修复**</font>\n'
+        '<font color="warning">**回踩做多：完整多头 + RSI回落中性 + 贴近EMA20(低吸)**</font>\n'
         f"> 条件: RSI {STRONG_LONG_RSI_LO}-{STRONG_LONG_RSI_HI}, "
-        f"距EMA20 0-{STRONG_LONG_MAX_DIST}%\n"
+        f"距EMA20 {STRONG_LONG_MIN_DIST}~{STRONG_LONG_MAX_DIST}%; 破EMA50/100离场\n"
         + "\n".join(lines)
         + "\n"
     )
@@ -451,6 +453,8 @@ def run_once() -> int:
     render_groups(reports, unmatched)
     title, content = format_message(reports, unmatched)
     push_wecom(title, content)
+    longs = strong_long_items(reports)
+    print(f"[form] {datetime.now():%m-%d %H:%M} 回踩做多[{','.join(r.base for r in longs)}]", file=sys.stderr, flush=True)
     return 0
 
 

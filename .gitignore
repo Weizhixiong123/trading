@@ -11,3 +11,4 @@ configs/.env
 logs/
 
 .runtime/
+.venv

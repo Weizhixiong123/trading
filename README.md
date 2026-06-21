@@ -1,6 +1,6 @@
 # Binance Monitor
 
-币安 U 本位永续合约 4H K 线结构监控脚本，命中启动或观察信号后推送到企业微信群机器人。
+币安 U 本位永续合约启动雷达：全市场扫描，在币刚启动（24h 仅小涨但 15m 突然放量 + OI 进场）时推送企业微信预警，赶在它冲上涨幅榜之前发现。
 
 ## 项目结构
 
@@ -10,7 +10,6 @@ trading/
 │  └─ .env.example
 ├─ src/
 │  ├─ binance_monitor.py
-│  ├─ hype_radar.py
 │  ├─ hype_form.py
 │  └─ hype_sources.py
 ├─ tests/
@@ -33,87 +32,45 @@ python src/binance_monitor.py
 
 ## 启动脚本
 
-主要监控脚本支持定时运行，默认间隔 900 秒。
+各脚本独立循环运行：启动雷达默认 180 秒一扫，热点形态默认 900 秒。
 
 ```bash
 python src/binance_monitor.py
-python src/hype_radar.py
 python src/hype_form.py
 ```
 
-如果只想单次运行热度雷达或热点形态：
+如果只想单次运行热点形态：
 
 ```bash
-RADAR_RUN_ONCE=1 python src/hype_radar.py
 FORM_RUN_ONCE=1 python src/hype_form.py
 ```
 
-## 信号逻辑
+## 启动雷达信号逻辑 binance_monitor.py
 
-- 候选池：扫描 24h 成交额满足阈值的 USDT 合约，过滤 24h 已经过度拉升的币。
-- A 级 4H 启动：价格处于 EMA20/50 多头结构，当前 4H 放量上涨，OI 同步增长；适合等回踩 EMA20/50 不破后的右侧多点。
-- B 级 4H 蓄势：价格贴近 EMA20/50，距离前高还有空间，涨幅不大但量和 OI 开始转强；最适合低位观察做多。
-- C 级 4H 高位观察：价格已经靠近前高并处于高位突破区；只看回踩 EMA20/50 后的修复，不追高。
-- 追高过滤：价格距离 EMA20 过远时过滤信号；接近过热区时在推送中提示高位加速风险。
-- 冷却：同一币种默认 4 小时内不重复推送同级别信号。
+目标：在币**刚启动、还没冲上 24h 涨幅榜**时就发现它。**只做预警，不给开单点**——确认后用你自己的 4H/1H 右侧结构再决定是否进场。
 
-这版监控更适合提前发现 4H 级别的启动和蓄势币，不再以 5 分钟急拉作为主要判断依据。
+候选池：扫描 24h 成交额 ≥ `MIN_24H_QUOTE_VOL` 的 USDT 合约，取成交额 Top `TOP_N_BY_VOLUME`。
 
-## 热度雷达 hype_radar.py
+单根命中条件（**全部满足**才算这根 15m 命中，均可在 `.env` 配置）：
 
-把"舆情热度"和"行情波动"对齐到同一个币种维度，分三类输出：
+| 条件 | 默认 | 含义 |
+| --- | --- | --- |
+| 24h 涨幅 | `1% ~ 10%` | 刚启动，排除已经在榜上的 |
+| 15m 量比 | `≥ 3.0` | 当前 15m 量 / 前 20 根均量，突然放量 |
+| 15m 涨幅 | `1.5% ~ 9%` | 当根在加速，但不是已暴拉 |
+| 1H OI 增幅 | `≥ 5%` | 资金/杠杆进场 |
+| 资金费率 | `|funding| ≤ 0.25%` | 排除已过热 |
 
-- **A 趋势**：涨幅 ≥ 阈值 且 振幅 ≥ 阈值，量价齐升的真趋势（默认看合约盘）
-- **B 暴雷**：跌幅 ≤ 阈值 且 振幅 ≥ 阈值，已经崩盘的绞肉机，仅供回避或做空研究
-- **C 舆情驱动**：CoinGecko trending ∩ 币安 USDT 交易对，能交易的"被搜的币"
+推送模型（**高频扫描、每小时汇总推一次**）：
 
-数据源全部公开免登录：
-
-- **CoinGecko `/search/trending`**：近 24h 用户搜索最热的 15 个币
-- **Binance 现货 + U 本位合约 24h ticker**：涨幅、振幅、成交额
-
-热度币来源由 `hype_sources.py` 统一维护，`hype_radar.py` 和 `hype_form.py` 会使用同一批 CoinGecko trending + `EXTRA_HYPE_KEYWORDS` 热点币。
-
-```bash
-python3 src/hype_radar.py
-
-# 可选：补一些 CoinGecko 没收录但你想盯的币
-EXTRA_HYPE_KEYWORDS="MEME,POPCAT" python3 src/hype_radar.py
-```
-
-默认不推送企业微信，只打印/记录热度池，避免和 `hype_form.py` 重复刷屏。
-如果确实需要单独推送 **S 超级信号 / C 舆情驱动 / A 趋势 / B 暴雷**，设置：
-
-```text
-RADAR_PUSH_WECOM=1
-```
-
-未配置 `WECOM_KEY` 时自动 DRY-RUN，只打印不推送。可以挂到 cron 定时跑：
-
-```bash
-# 每小时整点跑一次
-0 * * * * cd /home/trading && /usr/bin/python3 src/hype_radar.py >> /tmp/radar.log 2>&1
-```
-
-可调阈值（环境变量）：
-
-```text
-RADAR_MIN_QUOTE_VOL       候选币 24h 成交额下限，默认 5,000,000
-RADAR_TOP_GAINERS         涨幅榜显示条数，默认 15
-RADAR_TOP_VOLATILE        振幅榜显示条数，默认 15
-RADAR_TREND_MIN_GAIN_PCT  A 类趋势涨幅下限，默认 5.0
-RADAR_TREND_MIN_AMP_PCT   A 类趋势振幅下限，默认 15.0
-RADAR_CRASH_MAX_LOSS_PCT  B 类暴雷跌幅上限（负数），默认 -10.0
-RADAR_CRASH_MIN_AMP_PCT   B 类暴雷振幅下限，默认 30.0
-RADAR_WECOM_TOP_N         推送时每个桶的最大行数，默认 8
-RADAR_PUSH_WECOM          是否推送热度雷达到企业微信，默认 0
-EXTRA_HYPE_KEYWORDS       手动补充进 C 类的币种，逗号分隔
-WECOM_KEY                 企业微信群机器人 key，留空则 DRY-RUN
-```
+- 每 `SCAN_INTERVAL_SEC=180` 秒扫一次，用**上一根已收盘的 15m K 线**判定（量比需站满一整根，假启动更少）。
+- 每根 15m 的命中累积成「连续命中根数」：连命中则 +1，断一根则归零。
+- 每 `PUSH_INTERVAL_SEC=3600` 秒（1 小时）推送一次,**只推连续命中 ≥ `MIN_CANDLE_STREAK`（默认 2）根、且在最新一根仍命中的币** —— 即持续启动，而非一次性闪现。单条消息最多列 `DIGEST_MAX_COINS=20` 个。
+- 局限：抓的是「刚启动」不是「启动前」；务必配合止损、小仓试错。
 
 ## 热点币 4H 形态  Binance Monitor
 
-只对 `hype_radar` 圈出的热点币（CoinGecko trending + 可选 `EXTRA_HYPE_KEYWORDS`）做
+只对 `hype_sources` 圈出的热点币（CoinGecko trending + 可选 `EXTRA_HYPE_KEYWORDS`）做
 4H 形态快照——**不下推荐，只描述现状**。每个币给出：
 
 - **形态分组**：完整多头 (20>50>100>200) / 完整空头 / 转折中 / 震荡
@@ -182,7 +139,5 @@ MAX_ABS_FUNDING_PCT     资金费率绝对值上限，过滤拥挤交易
 cd E:\code\trading
 
 Start-Process .\.runtime\python312\tools\python.exe -ArgumentList "-u src\binance_monitor.py" -WindowStyle Hidden -RedirectStandardOutput logs\binance_monitor.out.log -RedirectStandardError logs\binance_monitor.err.log
-
-Start-Process .\.runtime\python312\tools\python.exe -ArgumentList "-u src\hype_radar.py" -WindowStyle Hidden -RedirectStandardOutput logs\hype_radar.out.log -RedirectStandardError logs\hype_radar.err.log
 
 Start-Process .\.runtime\python312\tools\python.exe -ArgumentList "-u src\hype_form.py" -WindowStyle Hidden -RedirectStandardOutput logs\hype_form.out.log -RedirectStandardError logs\hype_form.err.log
