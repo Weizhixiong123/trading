@@ -67,11 +67,10 @@ CONCURRENCY = env_int("FORM_CONCURRENCY", 15)
 REQ_TIMEOUT = env_int("REQ_TIMEOUT", 10)
 FORM_INTERVAL_SEC = env_int("FORM_INTERVAL_SEC", 900)
 FORM_RUN_ONCE = os.getenv("FORM_RUN_ONCE", "0") == "1"
-# 回踩做多: 完整多头里, RSI 回落到中性(45-55, 不追高) + 价格贴近 EMA20
-STRONG_LONG_RSI_LO = env_int("FORM_STRONG_LONG_RSI_LO", 45)
-STRONG_LONG_RSI_HI = env_int("FORM_STRONG_LONG_RSI_HI", 55)
-STRONG_LONG_MIN_DIST = env_int("FORM_STRONG_LONG_MIN_DIST", -3)
-STRONG_LONG_MAX_DIST = env_int("FORM_STRONG_LONG_MAX_DIST", 5)
+# 放量趋势追入: 完整多头 + 价格站上 EMA20 + 当根放量(追涨, 不低吸)
+# 回测结论: 热点币做趋势 > 做回调; 量比(当根/前20根)≥1.5 显著提升胜率与盈亏比。
+TREND_VOL_RATIO_MIN = float(os.getenv("FORM_TREND_VOL_RATIO_MIN", "1.5"))
+TREND_MIN_DIST = float(os.getenv("FORM_TREND_MIN_DIST", "0"))   # 须站上 EMA20
 
 WECOM_WEBHOOK_KEY = os.getenv("WECOM_KEY", "PUT_YOUR_WECOM_KEY_HERE")
 WECOM_MAX_CONTENT = 3800
@@ -94,12 +93,12 @@ class FormReport:
     __slots__ = (
         "rank", "base", "symbol", "market", "form", "price", "ema20", "rsi",
         "dist_pct", "range_pos", "h20", "l20", "vol_trend", "vol_ratio",
-        "candles", "chg24h",
+        "vol_ratio_bar", "candles", "chg24h",
     )
 
     def __init__(self, rank, base, symbol, market, form, price, ema20, rsi,
                  dist_pct, range_pos, h20, l20, vol_trend, vol_ratio,
-                 candles, chg24h):
+                 vol_ratio_bar, candles, chg24h):
         self.rank = rank
         self.base = base
         self.symbol = symbol
@@ -114,6 +113,7 @@ class FormReport:
         self.l20 = l20
         self.vol_trend = vol_trend
         self.vol_ratio = vol_ratio
+        self.vol_ratio_bar = vol_ratio_bar
         self.candles = candles
         self.chg24h = chg24h
 
@@ -247,12 +247,16 @@ def analyze(rank: int, base: str, market: str, symbol: str,
     else:
         vol_trend = "缩量"
 
+    # 单根量比(最新已收盘 4H 量 / 前 20 根均量) — 用于放量趋势追入过滤, 与回测口径一致
+    base20_vol = sum(vols[-21:-1]) / 20.0 if len(vols) >= 21 else (sum(vols[:-1]) / max(len(vols) - 1, 1))
+    vol_ratio_bar = vols[-1] / base20_vol if base20_vol > 0 else 0.0
+
     return FormReport(
         rank=rank, base=base, symbol=symbol, market=market, form=form,
         price=price_live, ema20=e20, rsi=r, dist_pct=dist_pct,
         range_pos=range_pos, h20=h20, l20=l20, vol_trend=vol_trend,
-        vol_ratio=vol_ratio, candles=candle_signature(opens, closes),
-        chg24h=chg24h,
+        vol_ratio=vol_ratio, vol_ratio_bar=vol_ratio_bar,
+        candles=candle_signature(opens, closes), chg24h=chg24h,
     )
 
 
@@ -303,48 +307,38 @@ def md_section(form: str, items: List[FormReport]) -> str:
     return f'<font color="{color}">**【{form}】 {len(items)}**</font>\n' + "\n".join(lines) + "\n"
 
 
-def strong_long_items(reports: List[FormReport]) -> List[FormReport]:
+def trend_entry_items(reports: List[FormReport]) -> List[FormReport]:
+    """放量趋势追入: 完整多头 + 价格站上 EMA20 + 当根放量(量比≥阈值)."""
     out = [
         r for r in reports
         if r.form == FORM_BULL
-        and STRONG_LONG_RSI_LO <= r.rsi <= STRONG_LONG_RSI_HI
-        and STRONG_LONG_MIN_DIST <= r.dist_pct <= STRONG_LONG_MAX_DIST
+        and r.dist_pct >= TREND_MIN_DIST
+        and r.vol_ratio_bar >= TREND_VOL_RATIO_MIN
     ]
-    return sorted(out, key=lambda r: (r.dist_pct, -r.vol_ratio, r.rank))
+    return sorted(out, key=lambda r: (-r.vol_ratio_bar, -r.dist_pct, r.rank))
 
 
 def entry_zone(r: FormReport) -> str:
-    pullback_low = r.ema20
-    pullback_high = min(r.price, r.ema20 * 1.03)
-    if pullback_high < pullback_low:
-        pullback_high = pullback_low
-    breakout = r.h20
-    if r.range_pos >= 100:
-        return (
-            f"回踩 {fmt_price(pullback_low)}-{fmt_price(pullback_high)}; "
-            f"站稳 {fmt_price(breakout)}"
-        )
     return (
-        f"回踩 {fmt_price(pullback_low)}-{fmt_price(pullback_high)}; "
-        f"突破 {fmt_price(breakout)}"
+        f"现价追入 ~{fmt_price(r.price)}; "
+        f"跌破 EMA20 {fmt_price(r.ema20)} 移动止损"
     )
 
 
-def md_strong_long(items: List[FormReport]) -> str:
+def md_trend_entry(items: List[FormReport]) -> str:
     if not items:
         return ""
     lines = []
     for r in items:
         lines.append(
             f"> #{r.rank} `{r.base:<8}` {r.market:<3}  "
-            f"距EMA20 {r.dist_pct:>+5.1f}%  RSI {r.rsi:>4.1f}  "
-            f"{r.vol_trend}  位 {r.range_pos:>3.0f}%  24h {r.chg24h:>+5.1f}%\n"
+            f"量比 {r.vol_ratio_bar:>3.1f}  距EMA20 {r.dist_pct:>+5.1f}%  "
+            f"RSI {r.rsi:>4.1f}  位 {r.range_pos:>3.0f}%  24h {r.chg24h:>+5.1f}%\n"
             f"> 开仓观察: {entry_zone(r)}"
         )
     return (
-        '<font color="warning">**回踩做多：完整多头 + RSI回落中性 + 贴近EMA20(低吸)**</font>\n'
-        f"> 条件: RSI {STRONG_LONG_RSI_LO}-{STRONG_LONG_RSI_HI}, "
-        f"距EMA20 {STRONG_LONG_MIN_DIST}~{STRONG_LONG_MAX_DIST}%; 破EMA50/100离场\n"
+        '<font color="warning">**放量趋势追入：完整多头 + 站上EMA20 + 放量(追涨)**</font>\n'
+        f"> 条件: 站上EMA20, 量比≥{TREND_VOL_RATIO_MIN:g}(当根/前20根); 跌破EMA20移动止损\n"
         + "\n".join(lines)
         + "\n"
     )
@@ -360,9 +354,9 @@ def format_message(reports: List[FormReport], unmatched: List[Tuple[int, str]]) 
 
     summary = " ".join(f"{f} {len(by_form[f])}" for f in FORM_ORDER)
     parts = [f"> 共 {len(reports)} 个: {summary}\n"]
-    strong_section = md_strong_long(strong_long_items(reports))
-    if strong_section:
-        parts.append(strong_section)
+    trend_section = md_trend_entry(trend_entry_items(reports))
+    if trend_section:
+        parts.append(trend_section)
     for f in FORM_ORDER:
         parts.append(md_section(f, by_form[f]))
     if unmatched:
@@ -453,8 +447,8 @@ def run_once() -> int:
     render_groups(reports, unmatched)
     title, content = format_message(reports, unmatched)
     push_wecom(title, content)
-    longs = strong_long_items(reports)
-    print(f"[form] {datetime.now():%m-%d %H:%M} 回踩做多[{','.join(r.base for r in longs)}]", file=sys.stderr, flush=True)
+    longs = trend_entry_items(reports)
+    print(f"[form] {datetime.now():%m-%d %H:%M} 放量趋势追入[{','.join(r.base for r in longs)}]", file=sys.stderr, flush=True)
     return 0
 
 
