@@ -30,6 +30,20 @@ python src/binance_monitor.py
 
 如果不配置 `WECOM_KEY`，脚本会以 DRY-RUN 模式运行，只打印信号，不推送消息。
 
+## Docker 部署
+
+推送到 `main` 后，GitHub Actions 自动构建镜像 `ghcr.io/weizhixiong123/trading:latest`。
+服务器上不需要源码，只放 `docker-compose.yml` 和 `configs/.env`：
+
+```bash
+mkdir -p /opt/trading/configs && cd /opt/trading
+# 上传 docker-compose.yml 和 configs/.env (填 WECOM_KEY, 确认 FORM_INTERVAL_SEC=3600)
+docker compose pull && docker compose up -d
+docker compose logs -f hype-form
+```
+
+默认只启动热点币 4H 形态 `hype-form`；需要启动雷达时加 `--profile monitor`。
+
 ## 启动脚本
 
 各脚本独立循环运行：启动雷达默认 180 秒一扫，热点形态默认 900 秒。

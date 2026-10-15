@@ -1,0 +1,29 @@
+# 服务器上只需要本文件 + configs/.env, 不需要源码
+# 更新: docker compose pull && docker compose up -d
+services:
+  # 热点币 4H 形态: 每 FORM_INTERVAL_SEC 秒推送一次 (configs/.env 里设 3600 = 1 小时)
+  hype-form:
+    image: ghcr.io/weizhixiong123/trading:latest
+    container_name: hype-form
+    command: ["python", "src/hype_form.py"]
+    env_file: configs/.env
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # 启动雷达 (默认不启动): docker compose --profile monitor up -d
+  binance-monitor:
+    image: ghcr.io/weizhixiong123/trading:latest
+    container_name: binance-monitor
+    command: ["python", "src/binance_monitor.py"]
+    env_file: configs/.env
+    restart: unless-stopped
+    profiles: ["monitor"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
